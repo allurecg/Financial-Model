@@ -1,0 +1,9 @@
+.DS_Store
+*.log
+*.lock
+.~lock*
+.fuse_hidden*
+__pycache__/
+*.py[cod]
+.claude/scheduled_tasks.lock
+node_modules/

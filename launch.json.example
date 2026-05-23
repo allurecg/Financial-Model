@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "model",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-c", "python3 -m http.server $PORT --directory '/Users/paulchristodoulou/Documents/Claude/Projects/Financial Model'"],
+      "autoPort": true
+    },
+    {
+      "name": "deck",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-c", "python3 -m http.server $PORT --directory '/Users/paulchristodoulou/Documents/Claude/Projects/Financial Model/.deck_preview'"],
+      "autoPort": true
+    }
+  ]
+}
