@@ -202,3 +202,135 @@ The model's smart-draw logic borrows ONLY what's needed for deployment + overhea
 - All agent reports captured in this log
 
 Sleep well. Let's discuss the §6418 transfer rate first thing — that's the highest-impact open item ($1.2B economic effect).
+
+---
+
+## OVERNIGHT EXTENSION (2026-05-23 evening → 2026-05-24 AM) — Phase B + §6418 closeout
+
+User signaled "Please get this done before I wake up." This section captures the autonomous work done after the late-night spreadsheet alignment landed.
+
+### Top-up funding clarification (user direction)
+- M60 bullet (principal + 30% IRR premium) is **warehouse-funded** — cash neutral at M60.
+- Code path: top-up adds to `termLoanBal` and is expensed via `retainedEarnings -= topUpM1` + `moicTopUpExpenseM1`.
+- Warehouse starting balance at M60 = total bullet (principal + top-up), then amortizes straight-line over 60 months at 7%.
+- This is **not** equity-classified; it's a balance-sheet refinance. (ASC 470-50-40-17 extinguishment treatment still deferred — separate design conversation.)
+
+### §6418 investigation — RESOLVED (formula is correct)
+The agent's "98.6% effective transfer rate" finding was a **misinterpretation**, not a bug.
+
+**Formula at `60-1.html:4402-4411`:**
+```js
+const transferItcNet = totalItc × itcMarketPrice × (1 - transferInsurance/100);
+// = totalItc × 0.89 × (1 - 0.04) = totalItc × 0.854 ✓ correct at 85.4%
+
+const proceedsFromTransfer = transferItcNet + (deprNetValue × deprMonetizationRate);
+```
+
+The §6418 haircut (`0.89 × 0.96 = 0.8544`) is correctly applied to the ITC portion. Depreciation monetization is a **separate revenue stream** with its own economics — `deprNetValue = depreciationBasis × deprBuyerTaxRate(21%) / (1 + deprBuyerReturn(25%))` — and is NOT subject to the §6418 transfer haircut (because MACRS dep monetization isn't a tax-credit transfer; it's a separate cash sale of depreciation shields to a partner).
+
+The agent computed `total_cash / total_ITC_gross = 98.6%`, but that's apples-to-oranges: the numerator includes depreciation cash, while the denominator excludes the depreciation basis. The correct comparison is `transferItcNet / transferItcGross = 85.4%`, which the model produces.
+
+**Action:** No code change. Document the dual-revenue-stream structure on the FA tab so this doesn't get re-flagged. Possible future enhancement: split the display so `§6418 ITC cash` and `Depreciation monetization` are shown on separate lines instead of as combined `proceedsFromTransfer`.
+
+### Phase B — Per-entity Financial Statements (DELIVERED)
+
+User asked for Income Statement, Balance Sheet, and Cash Flow Statement for each of the 5+1 entities. **All three views built and rendering.** Sits behind a new tab: **FINANCIAL STATEMENTS → Entity P&Ls (Phase B)**.
+
+**Entity hierarchy applied** (from `edge-flow-v3.html`/`v4.html` diagrams + user direction):
+| Entity | Tax char | Holds | Notes |
+|---|---|---|---|
+| EDGE TopCo | C-corp | Boundless/warehouse debt, deferred fin, infra PP&E, sponsor common equity | Receives 1% dep allocation through HoldCo; pays Boundless interest; absorbs C-corp tax |
+| Master HoldCo | LLC pass-through | Pref Equity contributed capital (Phase 2) | Thin BS; hosts Pref Equity overlay starting Y2 |
+| Project JV | Partnership (1065) | Operating revenue, §6418 ITC cash (exempt), Class A contributed | Books all operating revenue + the §6418 cash flow |
+| Project SPE | DRE | Operating PP&E, inventory, CIP, accrued construction | Rolls into JV's Form 1065 |
+| DSE (Class A TE) | External pass-through | 99% of MACRS depreciation allocation (default) | Tax shield ~$2-3B over horizon at 21% federal |
+| Tax Pref Equity (Eric WY) | External (HoldCo overlay) | $210K/unit contribution starting Y2 (default) | 10% CoC accrued weekly |
+
+**Depreciation allocation: 99/1 by default** (DSE / HoldCo), with UI slider `depAllocationDSEPct` (0-100). Per Paul direction: best for consolidated tax (matches a Class A flip transaction posture).
+
+**Pref Equity state vars added (line ~2872):**
+- `depAllocationDSEPct` = 99 (slider)
+- `prefEquityStartYear` = 2 (input — when Pref Equity activates)
+- `prefEquityPerUnitContribution` = 210000 (input — $/unit Phase 2)
+- `prefEquityCoCRate` = 10.0 (input — % annual cost of capital)
+
+**Engine tracker added (line ~5347 declarations, ~5808 logic):**
+```js
+var cumulativePrefEquityBalanceM1 = 0;
+var prefEquityContribThisWeekM1 = 0;
+var prefEquityReturnThisWeekM1 = 0;
+var cumulativePrefEquityReturnPaidM1 = 0;
+
+// In weekly loop, after STEP 2 PTO/newPTO defined:
+if (financingMode === 1 && yearIdx+1 >= prefEquityStartYear) {
+    if (newPTO > 0) {
+        var prefContrib = newPTO * prefEquityPerUnitContribution;
+        cash += prefContrib;
+        accumulatedCapital += prefContrib;
+        cumulativePrefEquityBalanceM1 += prefContrib;
+        prefEquityContribThisWeekM1 = prefContrib;
+    }
+    if (cumulativePrefEquityBalanceM1 > 0) {
+        var prefReturnThisWk = cumulativePrefEquityBalanceM1 * (prefEquityCoCRate/100) / 52;
+        cash -= prefReturnThisWk;
+        retainedEarnings -= prefReturnThisWk;
+        prefEquityReturnThisWeekM1 = prefReturnThisWk;
+    }
+}
+```
+Trackers are pushed onto `ppaWeeklyData` row (so the entity P&L view can read them per-month).
+
+**Entity P&L view (line ~17737):**
+- 6 columns: TopCo / HoldCo / JV / SPE / DSE / Pref Eq
+- Period selector via hash anchor (`#period=60`) — avoids React hooks-rules violation inside a conditional render block. Click a period chip → page reloads with new hash.
+- Rows: Revenue / COGS / OpEx / EBITDA / Depreciation / Dep Tax Allocation / Boundless+Warehouse Interest / §6418 ITC Cash (exempt) / Pref Return / Pretax / Tax / NI
+- **TopCo tax adjustment**: engine's `totalTaxProvision` is computed on consolidated income (incorrectly attributing the full dep shield to EDGE). View adjusts TopCo tax by adding back DSE's 99% dep allocation: `topcoPretaxAdjusted = NIBT + dseDepAlloc; topcoTaxAdjusted = max(0, that) × 0.21`.
+- Boundless interest derived from `cumulativeInterestPaidM1` delta across weeks-in-month (the monthly engine's `actualDebtInterestPaid` shows $0 due to the pre-existing aggregation bug).
+
+**Entity Balance Sheet view (line ~17957):**
+- 6 columns, Assets on top half, Liabilities + Equity on bottom half
+- Cash at TopCo (display convenience); AR at JV; Inventory/CIP/PP&E at SPE; Boundless/Warehouse debt + deferred fin + infra PP&E + sponsor common equity at TopCo
+- DSE shows Class A investment (asset side); Pref Equity shows investment (asset side, external) and contributed capital (equity side at HoldCo)
+- Sponsor common equity = `controllingEquity − prefBal − teRaised`
+
+**Entity Cash Flow Statement view (line ~18026):**
+- Single-period (selected month) breakdown by entity
+- Operating / Investing / Financing categories
+- TE contribution + Pref Equity contribution + debt draws + repayments + interest paid + §6418 proceeds — all sourced from weekly trackers summed across the month (because monthly schema doesn't have them)
+
+**Critical bug caught + fixed during the build:**
+- First implementation read Pref Equity values from `monthlyPlanData` — but those trackers were never aggregated into monthly. View showed $0 for Pref Equity.
+- Fix: read from `ppaWeeklyData` (weekly trackers), summing/sampling per-month: balance = `weeksInMonth.slice(-1).cumulativePrefEquityBalanceM1`; return = `sum(weeksInMonth.prefEquityReturnThisWeekM1)`.
+- Same fix applied to `prefContribMonth`, `teContrib`, `tePrefPaid` in the CFS view.
+
+**React hooks violation caught + fixed during the build:**
+- First implementation used `React.useState` for `selectedPeriod` inside `{activeTab === 'entity_pnl' && (...) }` block. React error: "Rendered more hooks than during the previous render."
+- Fix: use `window.location.hash` for period state instead of useState. Period chips are `<a href="#period=60">` with onClick → reload after 50ms. No hooks needed.
+
+### What's STILL deferred (real Phase B.4 work)
+
+The entity views are **post-engine allocations** on top of the consolidated engine output. They don't replace the consolidated engine math. A "true" Phase B (entity-native engine) requires:
+- Per-entity ASC 740 tax provision with NOL carryforward (TopCo only)
+- §704(b) partnership waterfall in JV (allocation = ownership % × actual cash flows, not pro-rata)
+- §163(j) interest limitation at TopCo (30% of ATI cap)
+- Inter-entity flows (HoldCo → TopCo distributions, JV → HoldCo cash distributions, fee income from JV to TopCo for sponsor services)
+- §704(c) ceiling rule for built-in gain on contributed property
+- Full intercompany BS eliminations
+
+That's Phase B.4 — multi-week effort, needs design conversation. What's delivered now is the **MVP that displays the per-entity slices Paul asked for** so he can see who books what.
+
+### Files
+
+- `60-1.html` (2.87 MB) — canonical v60-1 with Phase A + Phase B + §6418 closeout
+- `60-1-OVERNIGHT-LOG.md` — this file
+- `60-1-MORNING-REVIEW.md` — 7 judgment-call doc (unchanged from earlier session)
+- `60-snapshot-diff.py` — regression helper (unchanged)
+
+### Pre-existing bugs flagged but NOT fixed this session (Paul's call)
+
+1. **Monthly cash negative M70-M95** — weekly clean; aggregation bug in monthly roll-up around M60 warehouse refi. **Not fixed** because Paul focused this session on Phase B, and the fix risks touching the M60 bullet logic.
+2. **Monthly `actualDebtInterestPaid` = $0** — needs weekly→monthly aggregation of `interestExp` + `boundlessMgmtFeeThisWeek` + `taxEquityPrefReturnThisWeekM1` into `weeklyMonthlyAgg[i]`. **Not fixed** — see #1.
+3. **Monthly DSCR = None** — downstream of #2.
+4. **Weekly tail buffer W521-W532 extends real operations** — fix is to gate deployment/draws/revenue at `w > 520`. **Not fixed** — cosmetic past M120, doesn't affect main reporting horizon.
+
+These are pre-existing and stable. Address in a dedicated session.

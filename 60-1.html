@@ -1996,6 +1996,7 @@ const activeFlows = useMemo(() => {
         balance_sheet: { name: "Balance Sheet", roles: ['admin', 'viewer'] },
         cashflow_statement: { name: "Cash Flow Statement", roles: ['admin', 'viewer'] },
         weekly_detail: { name: "Weekly Waterfall Detail", roles: ['admin', 'viewer'] },
+        entity_pnl: { name: "Entity P&Ls (Phase B)", roles: ['admin', 'viewer'] }, // v60-1 Phase B.1: 5+1 entity breakdown
         weekly_inputs: { name: "Weekly Installs", roles: ['admin', 'viewer'] },
         project_timeline: { name: "Project Assumptions", roles: ['admin', 'viewer'] },
         startup: { name: "Startup Costs", roles: ['admin', 'viewer'] },
@@ -2053,7 +2054,7 @@ const activeFlows = useMemo(() => {
         { label: 'DEAL STRUCTURE', keys: ['corporate_structure', 'money_flow', 'strategy', 'taxflip'] },
         { label: 'TIMELINE', keys: ['startup_runup', 'timeline', 'timeline_transfer', 'cohort_tax_timeline', 'transfer_pipeline'] },
         { label: 'UNIT ECONOMICS', keys: ['solar_economics', 'net_residual', 'monthly_flow', 'grid_economics'] },
-        { label: 'FINANCIAL STATEMENTS', keys: ['income_statement', 'balance_sheet', 'cashflow_statement', 'weekly_detail'] }, // v43-65: Income Statement promoted to default landing tab
+        { label: 'FINANCIAL STATEMENTS', keys: ['income_statement', 'balance_sheet', 'cashflow_statement', 'weekly_detail', 'entity_pnl'] }, // v43-65: Income Statement promoted to default landing tab; v60-1 added entity_pnl
         { label: 'CAPITAL & COSTS', keys: ['infra_expansion', 'startup', 'capital_stack', 'headcount', 'project_cost_schedule', 'replacement_capex'] },
         { label: 'ANALYSIS', keys: ['capital_velocity', 'homeowner', 'dcf_valuation', 'collateral_map', 'fmv_report_appraisal', 'fmv_report_cost_seg', 'fmv_report', 'fmv_report_unergy_appraisal', 'fmv_report_unergy_cost_seg', 'fmv_report_unergy', 'itc_eligibility_ledger', 'supplier_compliance'] }, // v50-33: split FMV → Appraisal-only / Cost-Seg-only / Combined for both EDGE and Unergy. Appraisal-only available to all audiences; Cost-Seg-only + Combined restricted to super_admin.
         { label: 'AUDITOR', keys: ['audit_logic', 'audit_worksheet', 'audit_reference', 'audit_export'] }, // v43-65: Model Logic promoted to default landing tab
@@ -2867,6 +2868,20 @@ const activeFlows = useMemo(() => {
         // v60-1 (Q8 2026-05-22): Tax equity cost of capital — 10% annual on cumulativeTaxEquityRaisedM1.
         //   Accrued weekly (× 10% / 52), paid in cash, expensed via retainedEarnings.
         const [taxEquityCostOfCapitalRate, setTaxEquityCostOfCapitalRate] = useState(10.0);
+        // v60-1 Phase B.1 (2026-05-23): Entity-allocation state for 5-entity P&L framework.
+        //   depAllocationDSEPct: percentage of project depreciation allocated to DSE (Class A TE)
+        //     pre-flip. Diagrams show 99% standard partnership flip; user wants adjustable.
+        //     Complement (100 - DSE%) goes to HoldCo (Class B) and ultimately rolls to EDGE TopCo.
+        //   prefEquityStartYear: when Tax Pref Equity (Eric WY entity) is introduced. Default Y2.
+        //     Per user decision 2026-05-23: Pref sits at HoldCo (not JV) — preserves consolidated
+        //     tax efficiency (Pref doesn't dilute the §6418 ITC / depreciation flows at JV).
+        //   prefEquityPerUnitContribution: $ contributed by Pref Equity per new unit deployed
+        //     starting at prefEquityStartYear. Default $210K per diagram v3/v4 Phase 2.
+        const [depAllocationDSEPct, setDepAllocationDSEPct] = useState(99);
+        const [prefEquityStartYear, setPrefEquityStartYear] = useState(2);
+        const [prefEquityPerUnitContribution, setPrefEquityPerUnitContribution] = useState(210000);
+        // Pref Equity cost of capital (preferred return rate, annual). Default 10%.
+        const [prefEquityCoCRate, setPrefEquityCoCRate] = useState(10.0);
 
         // --- DYNAMIC AGGREGATORS (Replaces old scalar states to keep math intact) ---
         const profFees = y1ProfFees[11]; // Tab 1 Display pulls M12 run-rate
@@ -5326,6 +5341,13 @@ const financials = useMemo(() => {
         // v60-1 Q8: Tax equity 10% cost of capital — accrued and paid weekly on cumulative outstanding.
         var taxEquityPrefReturnThisWeekM1 = 0;
         var cumulativeTaxEquityPrefReturnM1 = 0;
+        // v60-1 Phase B.2: Pref Equity tracker (HoldCo level, Phase 2 = Year >= prefEquityStartYear).
+        // Each new unit deployed in Phase 2 brings prefEquityPerUnitContribution to HoldCo cash.
+        // Cumulative balance accrues prefEquityCoCRate% annual return paid weekly to Pref Equity holder.
+        var cumulativePrefEquityBalanceM1 = 0;
+        var prefEquityContribThisWeekM1 = 0;
+        var prefEquityReturnThisWeekM1 = 0;
+        var cumulativePrefEquityReturnPaidM1 = 0;
 
         // EQUITY
         var retainedEarnings = 0;
@@ -5526,6 +5548,10 @@ const financials = useMemo(() => {
                 taxEquityPrefReturnThisWeekM1 = teCostThisWeek;
                 cumulativeTaxEquityPrefReturnM1 += teCostThisWeek;
             }
+
+            // v60-1 Phase B.2: Pref Equity placeholder (logic moved post-newPTO defn below).
+            prefEquityContribThisWeekM1 = 0;
+            prefEquityReturnThisWeekM1 = 0;
 
             // ============================================================================
             // v43-46 (Phase 8 basis matter (b) closure): Mode 4 cumulative-PPE LTV gate
@@ -5765,6 +5791,32 @@ const financials = useMemo(() => {
 
             // Track fleet for revenue lag
             fleetByWeek.push(cumulativeFleet);
+
+            // v60-1 Phase B.2: Pref Equity (Phase 2 only — Year >= prefEquityStartYear).
+            //   At HoldCo level per Paul direction 2026-05-23.
+            //   Each new unit at PTO in Phase 2 adds prefEquityPerUnitContribution to cash
+            //   (capital inflow from external Pref Equity holder) and to cumulative balance.
+            //   Cumulative balance accrues prefEquityCoCRate% annual return paid weekly to
+            //   the Pref Equity holder. Return reduces cash and RE; classified as financial
+            //   cost at HoldCo. Booked into accumulatedCapital (not RE) for contributions.
+            if (financingMode === 1) {
+                var prefActive = (yearIdx + 1) >= (prefEquityStartYear || 2);
+                if (prefActive && newPTO > 0) {
+                    var prefContrib = newPTO * (prefEquityPerUnitContribution || 0);
+                    cash += prefContrib;
+                    accumulatedCapital += prefContrib;
+                    cumulativePrefEquityBalanceM1 += prefContrib;
+                    prefEquityContribThisWeekM1 = prefContrib;
+                }
+                if (cumulativePrefEquityBalanceM1 > 0) {
+                    var prefRateWk = ((prefEquityCoCRate || 10) / 100) / 52;
+                    var prefReturnThisWk = cumulativePrefEquityBalanceM1 * prefRateWk;
+                    cash -= prefReturnThisWk;
+                    retainedEarnings -= prefReturnThisWk;
+                    prefEquityReturnThisWeekM1 = prefReturnThisWk;
+                    cumulativePrefEquityReturnPaidM1 += prefReturnThisWk;
+                }
+            }
 
             // ============================
             // STEP 3a: M3 CASH PAYMENT (at PTO, 2-week lag)
@@ -6264,17 +6316,18 @@ const financials = useMemo(() => {
                 // Premium (top-up) = bullet − principal owed. Floor at 0 if bullet already covers IRR via interest.
                 var topUpM1 = Math.max(0, totalBulletToBGI - termLoanBal);
                 if (topUpM1 > 0) {
-                    // v60-1 (user direction 2026-05-23): top-up is a CASH REPAYMENT, not equity.
-                    //   At M60, EDGE pays BGI the top-up premium directly from cash (real cash event).
-                    //   Warehouse refinances ONLY the principal balance (net-zero for principal).
-                    //   So: cash drops by topUp (premium paid to BGI); termLoanBal stays at principal.
-                    cash -= topUpM1;
+                    // v60-1 (user-confirmed 2026-05-23 PM): warehouse funds the M60 top-up.
+                    //   The booking is NOT equity-classified — it's a debt issuance (warehouse takes on
+                    //   the premium as new principal) + expense (retainedEarnings reduced).
+                    //   Net cash impact at M60: 0 (warehouse advance offsets BGI premium payment).
+                    //   termLoanBal grows by topUpM1; debt service M61+ at warehouse rate.
+                    termLoanBal += topUpM1;
                     retainedEarnings -= topUpM1;
                     moicTopUpExpenseM1 = topUpM1;
                 }
-                // Capture warehouse starting balance = principal only (no premium added to debt).
+                // Capture warehouse starting balance (principal + premium it absorbed).
                 warehouseStartingBalM1 = termLoanBal;
-                // termLoanBal stays at principal; rate changes M61+ via warehouseDebtRate; amort begins M61.
+                // termLoanBal continues into warehouse era; rate changes M61+; amort begins M61.
             }
 
             // v60-1 (corrected 2026-05-23): WAREHOUSE FACILITY STRAIGHT-LINE AMORTIZATION
@@ -6651,6 +6704,10 @@ const financials = useMemo(() => {
                 taxEquityPrefReturnThisWeekM1: taxEquityPrefReturnThisWeekM1,
                 cumulativeTaxEquityPrefReturnM1: cumulativeTaxEquityPrefReturnM1,
                 boundlessMgmtFeeThisWeek: boundlessMgmtFeeThisWeek,
+                prefEquityContribThisWeekM1: prefEquityContribThisWeekM1,
+                prefEquityReturnThisWeekM1: prefEquityReturnThisWeekM1,
+                cumulativePrefEquityBalanceM1: cumulativePrefEquityBalanceM1,
+                cumulativePrefEquityReturnPaidM1: cumulativePrefEquityReturnPaidM1,
 
                 // Revenue breakdown
                 revFleet: revFleet,   // Lagged fleet actually earning PPA/VPP revenue this week
@@ -11453,6 +11510,27 @@ const currentMonths = isSummaryView ? [] : monthlyPlanData.slice((Number(viewMod
                             <div className="text-[10px] text-slate-400">Cost of Capital (% annual)</div>
                             <input type="number" step="0.1" value={taxEquityCostOfCapitalRate} onChange={e => setTaxEquityCostOfCapitalRate(parseFloat(e.target.value) || 0)} className="w-full bg-transparent text-sm text-white font-bold mt-1 outline-none" />
                         </div>
+                        {/* v60-1 Phase B.1: Entity allocation controls (depreciation split + Pref Equity timing/size) */}
+                        <div className="text-xs font-bold text-indigo-300 uppercase tracking-wider mt-3">Entity Allocation (Phase B)</div>
+                        <div className="grid grid-cols-2 gap-2">
+                            <div className="bg-slate-900 p-2 rounded border border-slate-700">
+                                <div className="text-[10px] text-slate-400">Dep Alloc to DSE (%)</div>
+                                <input type="number" step="1" min="0" max="100" value={depAllocationDSEPct} onChange={e => setDepAllocationDSEPct(Math.max(0, Math.min(100, parseFloat(e.target.value) || 0)))} className="w-full bg-transparent text-sm text-white font-bold mt-1 outline-none" />
+                            </div>
+                            <div className="bg-slate-900 p-2 rounded border border-slate-700">
+                                <div className="text-[10px] text-slate-400">HoldCo (%) — auto</div>
+                                <div className="w-full text-sm text-slate-400 font-bold mt-1">{(100 - depAllocationDSEPct).toFixed(0)}%</div>
+                            </div>
+                            <div className="bg-slate-900 p-2 rounded border border-slate-700">
+                                <div className="text-[10px] text-slate-400">Pref Equity Start (Year)</div>
+                                <input type="number" step="1" min="1" max="10" value={prefEquityStartYear} onChange={e => setPrefEquityStartYear(Math.max(1, Math.min(10, parseInt(e.target.value) || 2)))} className="w-full bg-transparent text-sm text-white font-bold mt-1 outline-none" />
+                            </div>
+                            <div className="bg-slate-900 p-2 rounded border border-slate-700">
+                                <div className="text-[10px] text-slate-400">Pref / Unit ($)</div>
+                                <input type="number" step="10000" value={prefEquityPerUnitContribution} onChange={e => setPrefEquityPerUnitContribution(parseFloat(e.target.value) || 0)} className="w-full bg-transparent text-sm text-white font-bold mt-1 outline-none" />
+                            </div>
+                        </div>
+                        <div className="text-[10px] text-slate-500 italic">Pref Equity sits at HoldCo level (per Paul direction 2026-05-23) — preserves JV's 99/1 dep allocation and §6418 tax-exempt ITC flow undiluted.</div>
                         <div className="text-[10px] text-amber-400 italic pt-2 border-t border-slate-700">Legacy pledge inputs (3% Y1 / 2% Y2+, target balances) below are no longer used by Mode 1 — Boundless v2.6 supersedes them.</div>
                         <div className="flex justify-between items-center mb-1 mt-3">
                             <span className="text-xs text-slate-500 italic">Legacy: Pledge Fee Timing (3% Y1 / 2% Y2+)</span>
@@ -11512,7 +11590,7 @@ const currentMonths = isSummaryView ? [] : monthlyPlanData.slice((Number(viewMod
                                 {financingMode === 2 ? 'Project Finance Mode' : 'Traditional Finance Mode'}
                             </div>
                             <div className="text-xs text-slate-400">
-                                {financingMode === 2 ? 'Single $' + (straightDebtFacility / 1000000).toFixed(0) + 'M revolving facility. No pledge paydowns or balloon mechanics.' : financingMode === 3 ? 'Hybrid capital structure: ' + mode3PensionPct + '% CGE Coupon debt tranche (amortizing, ' + mode3CouponRate.toFixed(1) + '% annualized coupon paid semi-annually) + ' + (100 - mode3PensionPct) + '% first-loss GP equity tranche (' + mode3EquityKicker + '% equity kicker).' : '100% capital provider financing with fully amortizing annuity. No equity kicker or dividends.'}
+                                {financingMode === 2 ? 'Single $' + (straightDebtFacility / 1000000).toFixed(0) + 'M revolving facility. No Boundless-style paydown schedule or bullet maturity.' : financingMode === 3 ? 'Hybrid capital structure: ' + mode3PensionPct + '% CGE Coupon debt tranche (amortizing, ' + mode3CouponRate.toFixed(1) + '% annualized coupon paid semi-annually) + ' + (100 - mode3PensionPct) + '% first-loss GP equity tranche (' + mode3EquityKicker + '% equity kicker).' : '100% capital provider financing with fully amortizing annuity. No equity kicker or dividends.'}
                             </div>
                         </div>
                     </div>
@@ -17655,6 +17733,359 @@ const currentMonths = isSummaryView ? [] : monthlyPlanData.slice((Number(viewMod
 )}
 
 
+{/* ---- v60-1 Phase B.1: ENTITY P&L VIEW (5+1 entity breakdown) ---- */}
+{activeTab === 'entity_pnl' && monthlyPlanData && monthlyPlanData.length > 0 && (() => {
+    // Period selector uses a hash anchor (not useState) to avoid React hooks-rules violation
+    // inside a conditional render block. Default M60 (end of Boundless / start of warehouse era).
+    const hashMatch = (typeof window !== 'undefined' && window.location.hash.match(/period=(\d+)/));
+    const selectedPeriod = hashMatch ? parseInt(hashMatch[1]) : 60;
+    const periodOptions = [12, 24, 36, 48, 60, 72, 96, 120];
+    const m = monthlyPlanData[Math.min(selectedPeriod - 1, monthlyPlanData.length - 1)] || {};
+    // Helpers
+    const fmtBn = (v) => {
+        const abs = Math.abs(v || 0);
+        if (abs >= 1e9) return (v < 0 ? '(' : '') + '$' + (abs/1e9).toFixed(2) + 'B' + (v < 0 ? ')' : '');
+        if (abs >= 1e6) return (v < 0 ? '(' : '') + '$' + (abs/1e6).toFixed(1) + 'M' + (v < 0 ? ')' : '');
+        if (abs >= 1e3) return (v < 0 ? '(' : '') + '$' + (abs/1e3).toFixed(0) + 'K' + (v < 0 ? ')' : '');
+        return (v < 0 ? '(' : '') + '$' + Math.abs(v).toFixed(0) + (v < 0 ? ')' : '');
+    };
+    // ── ENTITY ALLOCATION RULES (per Paul direction 2026-05-23, edge-flow-v3/v4 diagrams) ──
+    // JV books all operating revenue + the §6418 ITC transfer (tax-exempt).
+    // SPE (DRE) holds equipment cost basis and books depreciation; flows up to JV.
+    // TopCo holds Boundless debt — interest expense at TopCo. Captures vintage transfer gain.
+    // HoldCo aggregates; in Phase 2 (Y2+), hosts Pref Equity — preferred return flows out here.
+    // DSE: external Class A — receives depAllocationDSEPct% of MACRS depreciation (tax shield).
+    // Pref Equity: external — receives preferred return from HoldCo distributions.
+    const dseSharePct = (depAllocationDSEPct || 99) / 100;
+    const holdcoDepShare = 1 - dseSharePct;  // residual goes to HoldCo (then up to TopCo)
+    const grossRev = m.grossRevenue || 0;
+    const cogs = m.cogs || 0;
+    const fixedOpex = m.fixedOpex || 0;
+    const variableOpex = m.variableOpex || 0;
+    const totalOpex = m.totalOpex || 0;
+    const ebitdaRaw = m.ebitda || 0;
+    const deprExp = m.deprExpense || 0;
+    // Compute Boundless+warehouse interest, Pref Equity balance, etc. from WEEKLY data
+    // (these trackers live in ppaWeeklyData row schema, not monthlyPlanData).
+    // Locate the last week of the selected month.
+    const ppaWeekly = (typeof ppaWeeklyData !== 'undefined' && ppaWeeklyData) || [];
+    const weeksInMonth = ppaWeekly.filter(w => w.monthIdx === selectedPeriod - 1);
+    const lastWk = weeksInMonth.slice(-1)[0] || {};
+    const firstWk = weeksInMonth[0] || {};
+    const prevMonthLastWk = ppaWeekly.filter(w => w.monthIdx === selectedPeriod - 2).slice(-1)[0] || {};
+    // Boundless+warehouse interest = delta in cumulativeInterestPaidM1 across the month
+    const cumIntEndMonth = lastWk.cumulativeInterestPaidM1 || 0;
+    const cumIntStartMonth = prevMonthLastWk.cumulativeInterestPaidM1 || 0;
+    const debtInt = Math.max(0, cumIntEndMonth - cumIntStartMonth) || m.actualDebtInterestPaid || 0;
+    const itcCash = m.itcTransferCashCollectedThisMonth || 0;
+    // Pref Equity (Phase B.2 weekly trackers)
+    const prefBalance = lastWk.cumulativePrefEquityBalanceM1 || 0;
+    const prefActive = prefBalance > 0;
+    // Pref return for the month = sum across weeks in month (or approximate from last week × 4.33)
+    let prefReturn = 0;
+    let prefContribMonth = 0;
+    for (const wk of weeksInMonth) {
+        prefReturn += (wk.prefEquityReturnThisWeekM1 || 0);
+        prefContribMonth += (wk.prefEquityContribThisWeekM1 || 0);
+    }
+    // Allocate dep to DSE (99%) vs HoldCo (1%) for tax purposes; book stays at JV
+    const dseDepAlloc = deprExp * dseSharePct;
+    const holdcoDepAlloc = deprExp * holdcoDepShare;
+    // Compute per-entity P&L (column views; sum to consolidated by construction)
+    const entities = {
+        topco: {
+            name: 'EDGE TopCo',
+            type: 'C-corp',
+            color: 'text-indigo-300',
+            // TopCo receives 1% dep allocation through HoldCo; pays Boundless interest; absorbs C-corp tax
+            revenue: 0,
+            cogs: 0,
+            opex: 0,
+            ebitda: 0,
+            depreciation: 0,
+            interest: debtInt,  // Boundless/warehouse interest sits here
+            allocation: 0,
+            pretax: -debtInt,
+            tax: 0,  // computed below after allocations
+            ni: 0,
+        },
+        holdco: {
+            name: 'Master HoldCo',
+            type: 'LLC (pass-through)',
+            color: 'text-sky-300',
+            revenue: 0,
+            cogs: 0,
+            opex: 0,
+            ebitda: 0,
+            depreciation: 0,
+            interest: 0,
+            allocation: -holdcoDepAlloc, // dep tax allocation from JV (1% pre-flip)
+            prefReturn: prefReturn,  // pref equity dividend paid out (Phase 2)
+            pretax: -holdcoDepAlloc - prefReturn,
+            tax: 0,
+            ni: -holdcoDepAlloc - prefReturn,
+        },
+        jv: {
+            name: 'Project JV',
+            type: 'Partnership (Form 1065)',
+            color: 'text-emerald-300',
+            revenue: grossRev,
+            cogs: cogs,
+            // JV bears operating opex (fixedOpex + variableOpex from existing engine).
+            // Interest is at TopCo, so don't subtract it from JV's opex.
+            opex: fixedOpex + variableOpex,
+            ebitda: grossRev - cogs - (fixedOpex + variableOpex),
+            depreciation: deprExp,
+            interest: 0,
+            itcExempt: itcCash,
+            pretax: grossRev - cogs - (fixedOpex + variableOpex) - deprExp,
+            tax: 0,
+            ni: grossRev - cogs - (fixedOpex + variableOpex) - deprExp,
+        },
+        spe: {
+            name: 'Project SPE',
+            type: 'Disregarded LLC',
+            color: 'text-amber-300',
+            revenue: grossRev,  // operating revenue physically at SPE; rolls to JV via DRE
+            cogs: cogs,
+            note: 'Disregarded → rolls into JV Form 1065',
+        },
+        dse: {
+            name: 'DSE (Class A TE)',
+            type: 'External / Pass-through',
+            color: 'text-rose-300',
+            depAlloc: dseDepAlloc,  // tax shield received
+            taxBenefit: dseDepAlloc * 0.21,  // approximate value at 21% federal rate
+            note: depAllocationDSEPct + '% of $' + (deprExp/1e6).toFixed(1) + 'M depreciation',
+        },
+        prefEquity: {
+            name: 'Tax Pref Equity',
+            type: 'External (HoldCo level)',
+            color: 'text-purple-300',
+            active: prefActive,
+            contribution: prefActive ? prefEquityPerUnitContribution : 0,
+            preferredReturn: prefReturn,
+            note: prefActive ? 'Started Y' + prefEquityStartYear : 'Not active until Y' + prefEquityStartYear,
+        },
+    };
+    // Consolidated EDGE-side check: TopCo + HoldCo + JV (SPE rolls to JV via DRE; DSE/Pref external).
+    const consolPretax = entities.topco.pretax + entities.jv.pretax + entities.holdco.pretax;
+    const consolNI = m.netIncome || 0;
+    // Phase B.2 tax adjustment: TopCo's true tax should add back DSE's depreciation allocation
+    // (since DSE — external — shields ~99% of dep, NOT EDGE). The engine's totalTaxProvision is
+    // computed on consolidated income (incorrectly attributing the full dep shield to EDGE).
+    // True TopCo pretax = consolidated pretax + DSE dep allocation (added back).
+    // Then TopCo tax = 21% × max(0, that). Approximation; full ASC 740 with NOL is Phase B.4.
+    const topcoPretaxAdjusted = (m.netIncomeBeforeTax || consolPretax) + dseDepAlloc;
+    const topcoTaxAdjusted = Math.max(0, topcoPretaxAdjusted) * 0.21;
+    const taxProvisionEngine = m.totalTaxProvision || 0;
+    return (
+        <div className="p-6 space-y-6">
+            <Card className="border-indigo-500/30">
+                <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-xl font-bold text-white">Entity P&L View — M{selectedPeriod} Snapshot</h2>
+                    <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-[10px] text-slate-400 uppercase">Period:</span>
+                        {periodOptions.map(p => (
+                            <a key={p} href={'#period=' + p} onClick={() => { setTimeout(() => window.location.reload(), 50); }} className={`px-2 py-1 text-[10px] font-bold rounded border cursor-pointer ${selectedPeriod === p ? 'bg-indigo-600 text-white border-indigo-500' : 'bg-slate-900 text-slate-400 border-slate-700 hover:bg-slate-800'}`}>M{p}</a>
+                        ))}
+                    </div>
+                </div>
+                <div className="text-[10px] text-slate-500 mb-4">Phase B.1 MVP — Per-entity P&L allocation per Paul direction 2026-05-23. Depreciation allocated {depAllocationDSEPct}% to DSE (Class A) / {(100-depAllocationDSEPct)}% to HoldCo (Class B → TopCo). §6418 ITC transfer proceeds tax-exempt at JV per §6418(c)(1). Pref Equity at HoldCo level (Y{prefEquityStartYear}+, ${(prefEquityPerUnitContribution/1000).toFixed(0)}K/unit).</div>
+
+                {/* Entity columns */}
+                <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                        <thead>
+                            <tr className="border-b border-slate-700">
+                                <th className="text-left py-2 pr-3 text-slate-400 font-normal">Line Item</th>
+                                <th className="text-right py-2 px-3 text-indigo-300 font-bold">EDGE TopCo</th>
+                                <th className="text-right py-2 px-3 text-sky-300 font-bold">HoldCo</th>
+                                <th className="text-right py-2 px-3 text-emerald-300 font-bold">Project JV</th>
+                                <th className="text-right py-2 px-3 text-amber-300 font-bold">Project SPE</th>
+                                <th className="text-right py-2 px-3 text-rose-300 font-bold">DSE (ext)</th>
+                                <th className="text-right py-2 px-3 text-purple-300 font-bold">Pref Eq (ext)</th>
+                            </tr>
+                            <tr className="text-[9px] text-slate-500">
+                                <th className="text-left py-1 pr-3 italic">Tax char →</th>
+                                <th className="text-right py-1 px-3 italic">C-corp</th>
+                                <th className="text-right py-1 px-3 italic">Pass-through</th>
+                                <th className="text-right py-1 px-3 italic">Partnership</th>
+                                <th className="text-right py-1 px-3 italic">DRE</th>
+                                <th className="text-right py-1 px-3 italic">External</th>
+                                <th className="text-right py-1 px-3 italic">External</th>
+                            </tr>
+                        </thead>
+                        <tbody className="font-mono">
+                            <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Revenue</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(grossRev)}</td><td className="text-right text-slate-500">{fmtBn(grossRev)} <span className="text-[9px]">(rolls to JV)</span></td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                            <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">COGS</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(-cogs)}</td><td className="text-right text-slate-500">{fmtBn(-cogs)}</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                            <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Operating OpEx (Fixed + Variable)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(-(fixedOpex + variableOpex))}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                            <tr className="border-b border-slate-800 bg-slate-900/40"><td className="py-2 font-bold text-slate-200">EBITDA</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white font-bold">{fmtBn(entities.jv.ebitda)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                            <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Depreciation (book)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(-deprExp)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                            <tr className="border-b border-slate-800"><td className="py-2 text-slate-300 italic">  Dep Tax Allocation</td><td className="text-right">—</td><td className="text-right text-sky-300">{fmtBn(-holdcoDepAlloc)}</td><td className="text-right text-slate-500 italic">(allocated)</td><td className="text-right">—</td><td className="text-right text-rose-300">{fmtBn(dseDepAlloc)}</td><td className="text-right">—</td></tr>
+                            <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Boundless/Warehouse Interest</td><td className="text-right text-white">{fmtBn(-debtInt)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                            <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">§6418 ITC Cash (exempt)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-emerald-300">{fmtBn(itcCash)} <span className="text-[9px]">*exempt</span></td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                            <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Pref Return (Phase 2)</td><td className="text-right">—</td><td className="text-right text-purple-300">{fmtBn(-prefReturn)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-purple-300">{fmtBn(prefReturn)}</td></tr>
+                            <tr className="border-b border-slate-800 bg-slate-900/40"><td className="py-2 font-bold text-slate-200">Pretax Income</td><td className="text-right text-white font-bold">{fmtBn(entities.topco.pretax)}</td><td className="text-right text-white font-bold">{fmtBn(-holdcoDepAlloc - prefReturn)}</td><td className="text-right text-white font-bold">{fmtBn(entities.jv.pretax)}</td><td className="text-right text-slate-500">—</td><td className="text-right text-rose-300">{fmtBn(dseDepAlloc)}</td><td className="text-right text-purple-300">{fmtBn(prefReturn)}</td></tr>
+                            <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Income Tax (21% C-corp, dep-adjusted)</td><td className="text-right text-white">{fmtBn(-topcoTaxAdjusted)}</td><td className="text-right text-slate-500">— pass-through</td><td className="text-right text-slate-500">— partnership</td><td className="text-right text-slate-500">— DRE</td><td className="text-right text-slate-500">— external</td><td className="text-right text-slate-500">— external</td></tr>
+                            <tr className="bg-slate-900/60"><td className="py-2 font-bold text-white">Net Income</td><td className="text-right text-white font-bold">{fmtBn(entities.topco.pretax - topcoTaxAdjusted)}</td><td className="text-right text-white font-bold">{fmtBn(-holdcoDepAlloc - prefReturn)}</td><td className="text-right text-white font-bold">{fmtBn(entities.jv.pretax)}</td><td className="text-right">—</td><td className="text-right text-rose-300 font-bold">{fmtBn(dseDepAlloc)}</td><td className="text-right text-purple-300 font-bold">{fmtBn(-prefReturn)}</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div className="mt-6 grid grid-cols-2 gap-4 text-xs">
+                    <div className="bg-slate-900 p-3 rounded border border-slate-700">
+                        <div className="text-[10px] text-slate-400 uppercase font-bold mb-2">Consolidated (EDGE-side: TopCo + HoldCo + JV + SPE)</div>
+                        <div className="text-white font-mono">Pretax (engine NIBT): {fmtBn(m.netIncomeBeforeTax || 0)}</div>
+                        <div className="text-white font-mono">Engine totalTaxProvision: {fmtBn(-taxProvisionEngine)}</div>
+                        <div className="text-amber-300 font-mono">TopCo adjusted tax (this view): {fmtBn(-topcoTaxAdjusted)}</div>
+                        <div className="text-white font-mono font-bold mt-1">Engine Net Income: {fmtBn(consolNI)}</div>
+                        <div className="text-[9px] text-slate-500 italic mt-1">Engine NI uses consolidated tax. Phase B.2 view adjusts TopCo tax to add back DSE's {depAllocationDSEPct}% dep allocation (which EDGE doesn't shield).</div>
+                    </div>
+                    <div className="bg-slate-900 p-3 rounded border border-slate-700">
+                        <div className="text-[10px] text-slate-400 uppercase font-bold mb-2">External Parties</div>
+                        <div className="text-rose-300 font-mono">DSE dep allocation: {fmtBn(dseDepAlloc)}</div>
+                        <div className="text-rose-300 font-mono">DSE tax shield value (21%): {fmtBn(dseDepAlloc * 0.21)}</div>
+                        <div className="text-purple-300 font-mono mt-1">Pref Equity balance: {fmtBn(prefBalance)} {prefActive ? '(active)' : '(not started; Y' + prefEquityStartYear + '+)'}</div>
+                        <div className="text-purple-300 font-mono">Pref Equity return this month: {fmtBn(prefReturn)}</div>
+                    </div>
+                </div>
+                <div className="mt-4 text-[9px] text-slate-500 italic leading-relaxed border-t border-slate-800 pt-3">
+                    <strong>Phase B.2 scope:</strong> Entity rollup is a post-engine allocation on top of the consolidated engine output. TopCo tax adjusted upward to add back DSE's {depAllocationDSEPct}% depreciation allocation (EDGE only shields the remaining {100-depAllocationDSEPct}%). Boundless interest computed from cumulativeInterestPaidM1 delta (the monthly engine field shows $0 due to a pre-existing aggregation bug). Pref Equity flow at HoldCo per Paul direction. Full per-entity ASC 740 with NOL carryforward + §704(b) waterfall = Phase B.4.
+                </div>
+            </Card>
+
+            {/* v60-1 Phase B.3: ENTITY BALANCE SHEET (snapshot at end of selected period) */}
+            <Card className="border-sky-500/30 mt-6">
+                <h2 className="text-xl font-bold text-white mb-1">Entity Balance Sheet — M{selectedPeriod} Snapshot</h2>
+                <div className="text-[10px] text-slate-500 mb-4">Per-entity BS allocation. Assets shown on top half; liabilities + equity on bottom half. SPE rolls to JV (DRE).</div>
+                {(() => {
+                    const cashBal = m.cashBalance || 0;
+                    const arNet = m.arNet || 0;
+                    const inventory = (m.standardInventoryBal || 0) + (m.gpuInventoryBal || 0) + (m.operatingInventoryBal || 0);
+                    const cipGross = m.cipGross || 0;
+                    const ppeNet = m.ppeNet || 0;
+                    const infraPpeNet = m.infraPpeNet || 0;
+                    const intangibleNet = m.intangibleNet || 0;
+                    const deferredFinNet = m.deferredFinanceNet || 0;
+                    const safeHarborBal = m.safeHarborBal || 0;
+                    const termLoanBal = m.termLoanBal || 0;
+                    const accruedConstr = m.accruedConstrLiab || 0;
+                    const accruedInt = m.accruedIntLiab || 0;
+                    const cumDebtGross = m.cumulativeDebt || 0;  // for warehouse vs boundless split
+                    // Phase B.3 BS allocation rules (per edge-flow-v3/v4 diagrams + Paul direction):
+                    // TopCo: holds Boundless/Warehouse debt; small cash; sponsor common equity
+                    // HoldCo: thin BS; in Phase 2 holds Pref Equity contributed capital
+                    // JV/SPE: most of the operating assets (PPE, inventory, AR, CIP, intangibles)
+                    // DSE: external investment (Class A) — receivable from JV's accumulated dep allocations
+                    // Pref Equity: external investment in HoldCo
+                    const prefBal = m.cumulativePrefEquityBalanceM1 || 0;
+                    const teRaised = m.cumulativeTaxEquityRaisedM1 || 0;
+                    return (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-xs">
+                                <thead>
+                                    <tr className="border-b border-slate-700">
+                                        <th className="text-left py-2 pr-3 text-slate-400 font-normal">Line Item</th>
+                                        <th className="text-right py-2 px-3 text-indigo-300 font-bold">EDGE TopCo</th>
+                                        <th className="text-right py-2 px-3 text-sky-300 font-bold">HoldCo</th>
+                                        <th className="text-right py-2 px-3 text-emerald-300 font-bold">Project JV</th>
+                                        <th className="text-right py-2 px-3 text-amber-300 font-bold">Project SPE</th>
+                                        <th className="text-right py-2 px-3 text-rose-300 font-bold">DSE (ext)</th>
+                                        <th className="text-right py-2 px-3 text-purple-300 font-bold">Pref Eq (ext)</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="font-mono">
+                                    <tr className="border-b border-slate-800 bg-slate-900/30"><td className="py-1.5 text-slate-400 italic text-[10px] uppercase">Assets</td><td colSpan="6"></td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Cash</td><td className="text-right text-white">{fmtBn(cashBal)}</td><td className="text-right">—</td><td className="text-right text-slate-500 italic">(consolidated)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Accounts Receivable</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(arNet)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Inventory</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(inventory)}</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">CIP (Construction in Progress)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(cipGross)}</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">PP&E (net)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(ppeNet)}</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Infrastructure PP&E</td><td className="text-right text-white">{fmtBn(infraPpeNet)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Deferred Financing (net)</td><td className="text-right text-white">{fmtBn(deferredFinNet)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Safe Harbor / Intangibles</td><td className="text-right text-white">{fmtBn(safeHarborBal + intangibleNet)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Class A Investment (DSE)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-rose-300">{fmtBn(teRaised)}</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Pref Equity Investment</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-purple-300">{fmtBn(prefBal)}</td></tr>
+                                    <tr className="border-b border-slate-800 bg-slate-900/30"><td className="py-1.5 text-slate-400 italic text-[10px] uppercase">Liabilities & Equity</td><td colSpan="6"></td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Boundless/Warehouse Debt</td><td className="text-right text-white">{fmtBn(termLoanBal)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Accrued Construction Liab</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(accruedConstr)}</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Accrued Interest Liab</td><td className="text-right text-white">{fmtBn(accruedInt)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Pref Equity (contributed)</td><td className="text-right">—</td><td className="text-right text-purple-300">{fmtBn(prefBal)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Class A Contributed (JV)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-rose-300">{fmtBn(teRaised)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="bg-slate-900/60"><td className="py-2 font-bold text-slate-200">Sponsor Common Equity (RE + contrib)</td><td className="text-right text-white font-bold">{fmtBn((m.controllingEquity || m.totalEquity || 0) - prefBal - teRaised)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                </tbody>
+                            </table>
+                            <div className="mt-3 text-[9px] text-slate-500 italic">
+                                <strong>Phase B.3 simplification:</strong> Cash is shown at TopCo for display purposes (legally held at multiple entities). PP&E and operating assets shown at SPE (with title); SPE is a DRE so functionally rolls into JV's Form 1065. Class A / Pref Equity show external investor view (asset) and the contributed-capital view (equity at JV / HoldCo). Sponsor common equity is consolidated total equity less Class A and Pref Equity. Inter-entity eliminations not shown; full intercompany matrix = Phase B.4.
+                            </div>
+                        </div>
+                    );
+                })()}
+            </Card>
+
+            {/* v60-1 Phase B.3: ENTITY CASH FLOW STATEMENT (single period) */}
+            <Card className="border-emerald-500/30 mt-6">
+                <h2 className="text-xl font-bold text-white mb-1">Entity Cash Flow — M{selectedPeriod} (Single Period)</h2>
+                <div className="text-[10px] text-slate-500 mb-4">Per-entity cash flow for selected month. Operating / Investing / Financing breakdown.</div>
+                {(() => {
+                    const opCF = m.operatingCF || 0;
+                    const invCF = m.investingCF || 0;
+                    const finCF = m.financingCF || 0;
+                    const debtDraw = m.termDraw || m.pledgeDraw || m.debtInflow || 0;
+                    const debtRepayment = (m.warehousePrincipalPaidM1 || 0) + (m.termPrincipalPayment || 0);
+                    const intPaid = debtInt;
+                    const itcProceeds = itcCash;
+                    // Use outer-scope prefContribMonth + prefReturn (computed from weekly data sum)
+                    const prefContrib = prefContribMonth;
+                    const prefReturnPaid = prefReturn;
+                    // TE flows: sum across weeks-in-month from weekly data
+                    let teContrib = 0, tePrefPaid = 0;
+                    for (const wk of weeksInMonth) {
+                        teContrib += (wk.taxEquityRaisedThisWeekM1 || 0);
+                        tePrefPaid += (wk.taxEquityPrefReturnThisWeekM1 || 0);
+                    }
+                    return (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-xs">
+                                <thead>
+                                    <tr className="border-b border-slate-700">
+                                        <th className="text-left py-2 pr-3 text-slate-400 font-normal">Line Item</th>
+                                        <th className="text-right py-2 px-3 text-indigo-300 font-bold">EDGE TopCo</th>
+                                        <th className="text-right py-2 px-3 text-sky-300 font-bold">HoldCo</th>
+                                        <th className="text-right py-2 px-3 text-emerald-300 font-bold">Project JV</th>
+                                        <th className="text-right py-2 px-3 text-amber-300 font-bold">Project SPE</th>
+                                        <th className="text-right py-2 px-3 text-rose-300 font-bold">DSE (ext)</th>
+                                        <th className="text-right py-2 px-3 text-purple-300 font-bold">Pref Eq (ext)</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="font-mono">
+                                    <tr className="border-b border-slate-800 bg-slate-900/30"><td className="py-1.5 text-slate-400 italic text-[10px] uppercase">Operating</td><td colSpan="6"></td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Operating Cash Flow</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(opCF)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">  §6418 ITC Cash (exempt)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-emerald-300">{fmtBn(itcProceeds)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800 bg-slate-900/30"><td className="py-1.5 text-slate-400 italic text-[10px] uppercase">Investing</td><td colSpan="6"></td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Investing Cash Flow (capex)</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-white">{fmtBn(invCF)}</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800 bg-slate-900/30"><td className="py-1.5 text-slate-400 italic text-[10px] uppercase">Financing</td><td colSpan="6"></td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Debt Draw (Boundless/Warehouse)</td><td className="text-right text-white">{fmtBn(debtDraw)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Debt Repayment</td><td className="text-right text-white">{fmtBn(-debtRepayment)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Interest Paid</td><td className="text-right text-white">{fmtBn(-intPaid)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Class A (DSE) Contribution</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-rose-300">{fmtBn(teContrib)}</td><td className="text-right">—</td><td className="text-right text-rose-300">{fmtBn(-teContrib)}</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Class A (DSE) Return Paid</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-rose-300">{fmtBn(-tePrefPaid)}</td><td className="text-right">—</td><td className="text-right text-rose-300">{fmtBn(tePrefPaid)}</td><td className="text-right">—</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Pref Equity Contribution</td><td className="text-right">—</td><td className="text-right text-purple-300">{fmtBn(prefContrib)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-purple-300">{fmtBn(-prefContrib)}</td></tr>
+                                    <tr className="border-b border-slate-800"><td className="py-2 text-slate-300">Pref Equity Return Paid</td><td className="text-right">—</td><td className="text-right text-purple-300">{fmtBn(-prefReturnPaid)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right text-purple-300">{fmtBn(prefReturnPaid)}</td></tr>
+                                    <tr className="bg-slate-900/60"><td className="py-2 font-bold text-slate-200">Total Financing Activities</td><td className="text-right text-white font-bold">{fmtBn(finCF)}</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td><td className="text-right">—</td></tr>
+                                </tbody>
+                            </table>
+                            <div className="mt-3 text-[9px] text-slate-500 italic">
+                                <strong>Phase B.3 simplification:</strong> Operating + investing cash flows are shown at JV/SPE (consolidated source). Financing breakdown allocates by recipient: debt activity at TopCo, Class A flows DSE↔JV, Pref Equity flows extPref↔HoldCo. Inter-entity distribution waterfall (Pref → HoldCo → TopCo as common dividend) = Phase B.4.
+                            </div>
+                        </div>
+                    );
+                })()}
+            </Card>
+        </div>
+    );
+})()}
+
 {/* ---- INTEGRATED LIQUIDITY & YIELD CASCADE (v43-1 McKinsey Architecture) ---- */}
 {activeTab === 'weekly_detail' && ppaWeeklyData && ppaWeeklyData.length > 0 && (() => {
     const wd = ppaWeeklyData;
@@ -19498,23 +19929,23 @@ const currentMonths = isSummaryView ? [] : monthlyPlanData.slice((Number(viewMod
                             const combinedTax = fedTaxRate + stateTaxRate;
                             let blendedPreTax, debtRows;
                             if (financingMode === 1) {
-                                // Mode 1: Boundless v2.6 — weighted by actual drawn balances
-                                // Pledge effective cost = weighted average of Y1 and Y2-5 rates (as-drawn)
-                                const pledgeEffCost = ((pledgeFeeY1 * 1) + (pledgeFeeY2 * 4)) / 5; // 5-year weighted average
-                                const seniorCost = seniorDebtRate;
-                                // Weight by actual drawn balances from stabilized engine data
-                                const stableM = monthlyPlanData.find(m => m.month === 24) || monthlyPlanData[Math.min(23, monthlyPlanData.length - 1)] || {};
-                                const pledgeBal = stableM.termLoanBal || 0;
-                                const seniorBal = stableM.revolverBal || 0;
-                                const totalBal = pledgeBal + seniorBal;
-                                const wPledge = totalBal > 0 ? pledgeBal / totalBal : 0.85;
-                                const wSenior = totalBal > 0 ? seniorBal / totalBal : 0.15;
-                                blendedPreTax = (pledgeEffCost * wPledge) + (seniorCost * wSenior);
+                                // v60-1 Mode 1 (Boundless v2.6): blended cost of debt across M1-M60
+                                // Boundless period + M61-M120 warehouse period (weighted by months in each).
+                                const boundlessRate = (boundlessInterestRate || debtRate) || 8.0;
+                                const whRate = (warehouseDebtRate) || 7.0;
+                                // Amortize the 3% per-draw tx fee over the 5-year Boundless term → ~0.6%/yr
+                                const txFeeAnnualized = (boundlessTxFeePct || 3.0) / 5;
+                                // 50/50 weighting Boundless vs Warehouse over 120-mo horizon
+                                const wBoundless = 60 / 120;
+                                const wWarehouse = 60 / 120;
+                                const boundlessAllIn = boundlessRate + txFeeAnnualized;
+                                blendedPreTax = (boundlessAllIn * wBoundless) + (whRate * wWarehouse);
                                 debtRows = [
-                                    { label: termDebtLabel.replace(' Loan', '').replace(' Facility', '') + ' Fee', value: pledgeFeeY1.toFixed(1) + '% Y1 / ' + pledgeFeeY2.toFixed(1) + '% Y2+', color: 'text-slate-300' },
-                                    { label: 'Pledge Eff. Annual Cost (5yr avg)', value: pledgeEffCost.toFixed(2) + '%', color: 'text-slate-300' },
-                                    { label: seniorDebtLabel + ' Rate', value: seniorCost.toFixed(2) + '%', color: 'text-slate-300' },
-                                    { label: 'Wt. Avg (' + (wPledge * 100).toFixed(0) + '/' + (wSenior * 100).toFixed(0) + ' Split)', value: blendedPreTax.toFixed(2) + '%', color: 'text-slate-300' },
+                                    { label: 'Boundless Interest Rate', value: boundlessRate.toFixed(2) + '%', color: 'text-slate-300' },
+                                    { label: 'Tx Fee Amortized (3%/5yr)', value: txFeeAnnualized.toFixed(2) + '%', color: 'text-slate-300' },
+                                    { label: 'Boundless All-In (M1-M60)', value: boundlessAllIn.toFixed(2) + '%', color: 'text-slate-400' },
+                                    { label: 'Warehouse Rate (M61-M120)', value: whRate.toFixed(2) + '%', color: 'text-slate-300' },
+                                    { label: 'Blended (50/50 weighting)', value: blendedPreTax.toFixed(2) + '%', color: 'text-slate-300' },
                                 ];
                             } else if (financingMode === 2) {
                                 // Mode 2: Project Finance Revolving — single facility rate
@@ -26203,17 +26634,22 @@ const currentMonths = isSummaryView ? [] : monthlyPlanData.slice((Number(viewMod
                                     <div className="bg-slate-950 border-l-4 border-amber-500 rounded-r-xl p-5">
                                         <div className="flex items-center justify-between">
                                             <div>
-                                                <div className="text-[9px] text-amber-400 font-bold uppercase tracking-wider">Second Priority — Pledge / Term Facility</div>
-                                                <div className="text-lg font-mono font-bold text-white mt-1">{fmtB(snapMonth.termLoanBal || 0)}</div>
+                                                <div className="text-[9px] text-amber-400 font-bold uppercase tracking-wider">{financingMode === 1 ? 'Cosmetic — TopCo Equity Pledge' : 'Second Priority — Term Facility'}</div>
+                                                <div className="text-lg font-mono font-bold text-white mt-1">{financingMode === 1 ? '60% of TopCo equity' : fmtB(snapMonth.termLoanBal || 0)}</div>
                                             </div>
                                             <div className="text-right">
-                                                <div className="text-[9px] text-slate-500 uppercase">Collateral Pledged</div>
-                                                <div className="text-[10px] text-slate-300 mt-1">Subordinated lien on all assets, SPE membership interests, tax credit receivables, cash sweep waterfall residuals</div>
+                                                <div className="text-[9px] text-slate-500 uppercase">{financingMode === 1 ? 'Cosmetic — No Cash Mechanic' : 'Collateral'}</div>
+                                                <div className="text-[10px] text-slate-300 mt-1">{financingMode === 1 ? 'Per Boundless v2.6: 60% equity pledge at TopCo level. Legal pledge survives but no project-level lien, no ITC sweep, no PTO trigger. v2.7 redline begins 10%/6mo release from M18.' : 'Subordinated lien on all assets, SPE membership interests, tax credit receivables, cash sweep waterfall residuals'}</div>
                                             </div>
                                         </div>
                                         <div className="mt-3 flex gap-2 flex-wrap">
-                                            <span className="text-[8px] bg-amber-900/40 text-amber-300 px-2 py-0.5 rounded border border-amber-700/40">Subordination Agreement</span>
-                                            <span className="text-[8px] bg-amber-900/40 text-amber-300 px-2 py-0.5 rounded border border-amber-700/40">Pledge of SPE Interests</span>
+                                            {financingMode === 1 ? (<>
+                                                <span className="text-[8px] bg-amber-900/40 text-amber-300 px-2 py-0.5 rounded border border-amber-700/40">v2.6: 60% TopCo Equity Pledge</span>
+                                                <span className="text-[8px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded border border-slate-700">No Cash-Flow Impact</span>
+                                            </>) : (<>
+                                                <span className="text-[8px] bg-amber-900/40 text-amber-300 px-2 py-0.5 rounded border border-amber-700/40">Subordination Agreement</span>
+                                                <span className="text-[8px] bg-amber-900/40 text-amber-300 px-2 py-0.5 rounded border border-amber-700/40">Pledge of SPE Interests</span>
+                                            </>)}
                                         </div>
                                     </div>
                                     <div className="bg-slate-950 border-l-4 border-emerald-500 rounded-r-xl p-5">
@@ -28715,8 +29151,8 @@ const currentMonths = isSummaryView ? [] : monthlyPlanData.slice((Number(viewMod
                                         <div className="mb-1 italic text-slate-400">
                                             P<sub>svc</sub> = B<sub>t</sub> &times; <span className="text-rose-400">r(1+r)<sup>n</sup> / [(1+r)<sup>n</sup> &minus; 1]</span>
                                         </div>
-                                        <div className="text-[10px] text-slate-500 uppercase mb-1 mt-2 font-bold">{termDebtLabel} (Interest-Only)</div>
-                                        <div className="text-slate-400 text-[10px]">I<sub>pledge</sub>(t) = B<sub>pledge</sub> &times; r<sub>p</sub> &nbsp;&nbsp;|&nbsp;&nbsp; Paydown via &int; ExcessCF dt</div>
+                                        <div className="text-[10px] text-slate-500 uppercase mb-1 mt-2 font-bold">{termDebtLabel} (Interest-Only, Boundless v2.6)</div>
+                                        <div className="text-slate-400 text-[10px]">I<sub>b</sub>(t) = B<sub>b</sub> &times; r<sub>b</sub> &nbsp;&nbsp;|&nbsp;&nbsp; Bullet at M60: B<sub>b</sub> + Premium &rarr; 30% XIRR</div>
                                     </div>
                                     <div className="bg-slate-950 p-4 rounded border border-emerald-800/40 font-mono text-xs">
                                         <div className="text-[10px] text-emerald-300 uppercase mb-1 font-bold">Mode 4 Cumulative-PPE LTV Gate (v43-46)</div>
@@ -28891,7 +29327,7 @@ const currentMonths = isSummaryView ? [] : monthlyPlanData.slice((Number(viewMod
                                         <tbody className="text-slate-300">
                                             <tr className="border-b border-slate-800/30"><td className="py-1.5 font-mono text-emerald-300">P<sub>svc</sub></td><td className="py-1.5">Debt Service</td><td className="py-1.5 text-slate-400">Monthly fully-amortizing payment (P&amp;I) on senior facility</td><td className="py-1.5 text-right text-slate-500">$/mo</td></tr>
                                             <tr className="border-b border-slate-800/30"><td className="py-1.5 font-mono text-emerald-300">r</td><td className="py-1.5">Debt Rate</td><td className="py-1.5 text-slate-400">Annual interest rate on senior/term debt facility</td><td className="py-1.5 text-right text-slate-500">%/yr</td></tr>
-                                            <tr className="border-b border-slate-800/30"><td className="py-1.5 font-mono text-emerald-300">r<sub>p</sub></td><td className="py-1.5">Pledge Rate</td><td className="py-1.5 text-slate-400">Interest rate on pledged/subordinate term debt</td><td className="py-1.5 text-right text-slate-500">%/yr</td></tr>
+                                            <tr className="border-b border-slate-800/30"><td className="py-1.5 font-mono text-emerald-300">r<sub>b</sub></td><td className="py-1.5">Boundless Rate</td><td className="py-1.5 text-slate-400">Interest rate on Boundless v2.6 senior secured facility (Mode 1)</td><td className="py-1.5 text-right text-slate-500">%/yr</td></tr>
                                             <tr className="border-b border-slate-800/30"><td className="py-1.5 font-mono text-emerald-300">WACC</td><td className="py-1.5">Weighted Avg Cost</td><td className="py-1.5 text-slate-400">Blended cost of capital (equity + after-tax debt)</td><td className="py-1.5 text-right text-slate-500">%</td></tr>
                                             <tr className="border-b border-slate-800/30"><td className="py-1.5 font-mono text-emerald-300">g<sub>&infin;</sub></td><td className="py-1.5">Terminal Growth</td><td className="py-1.5 text-slate-400">Perpetuity growth rate for Gordon Growth terminal value</td><td className="py-1.5 text-right text-slate-500">%/yr</td></tr>
                                             <tr className="border-b border-slate-800/30"><td className="py-1.5 font-mono text-emerald-300">DSCR</td><td className="py-1.5">Debt Svc Coverage</td><td className="py-1.5 text-slate-400">Cash flow available for debt service &divide; total debt service</td><td className="py-1.5 text-right text-slate-500">x</td></tr>
